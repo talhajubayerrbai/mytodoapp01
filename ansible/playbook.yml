@@ -1,0 +1,264 @@
+---
+- name: Configure application server
+  hosts: all
+  become: true
+  vars:
+    app_port: 8000
+    app_dir: /opt/app
+    app_user: appuser
+    app_group: appuser
+    venv_dir: /opt/app/.venv
+    python_bin: /usr/bin/python3.11
+
+  tasks:
+    #  System packages 
+    - name: Update apt cache and install base packages
+      ansible.builtin.apt:
+        name:
+          - python3.11
+          - python3.11-venv
+          - python3.11-dev
+          - python3-pip
+          - nginx
+          - git
+          - curl
+        state: present
+        update_cache: yes
+        cache_valid_time: 3600
+
+    #  Application user 
+    - name: Create application group
+      ansible.builtin.group:
+        name: "{{ app_group }}"
+        state: present
+
+    - name: Create application user
+      ansible.builtin.user:
+        name: "{{ app_user }}"
+        group: "{{ app_group }}"
+        system: yes
+        shell: /usr/sbin/nologin
+        home: "{{ app_dir }}"
+        create_home: no
+        state: present
+
+    #  Application directory 
+    - name: Create application directory
+      ansible.builtin.file:
+        path: "{{ app_dir }}"
+        state: directory
+        owner: "{{ app_user }}"
+        group: "{{ app_group }}"
+        mode: "0755"
+
+    #  Copy application files 
+    - name: Copy main entrypoint
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../main.py"
+        dest: "{{ app_dir }}/main.py"
+        owner: "{{ app_user }}"
+        group: "{{ app_group }}"
+        mode: "0644"
+
+    - name: Copy app package directory
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../app/"
+        dest: "{{ app_dir }}/app/"
+        owner: "{{ app_user }}"
+        group: "{{ app_group }}"
+        mode: "0644"
+        directory_mode: "0755"
+
+    - name: Check if public/ directory exists in repository
+      ansible.builtin.stat:
+        path: "{{ playbook_dir }}/../public"
+      register: public_dir
+      delegate_to: localhost
+      become: false
+
+    - name: Copy public/ static assets (if present)
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../public/"
+        dest: "{{ app_dir }}/public/"
+        owner: "{{ app_user }}"
+        group: "{{ app_group }}"
+        mode: "0644"
+        directory_mode: "0755"
+      when: public_dir.stat.exists
+
+    - name: Copy requirements.txt (if present)
+      ansible.builtin.stat:
+        path: "{{ playbook_dir }}/../requirements.txt"
+      register: requirements_file
+      delegate_to: localhost
+      become: false
+
+    - name: Upload requirements.txt
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../requirements.txt"
+        dest: "{{ app_dir }}/requirements.txt"
+        owner: "{{ app_user }}"
+        group: "{{ app_group }}"
+        mode: "0644"
+      when: requirements_file.stat.exists
+
+    #  Python virtual environment 
+    - name: Create Python virtual environment
+      ansible.builtin.command:
+        cmd: "{{ python_bin }} -m venv {{ venv_dir }}"
+        creates: "{{ venv_dir }}/bin/activate"
+      become_user: "{{ app_user }}"
+
+    - name: Upgrade pip in venv
+      ansible.builtin.pip:
+        name: pip
+        state: latest
+        virtualenv: "{{ venv_dir }}"
+      become_user: "{{ app_user }}"
+
+    - name: Install Python dependencies from requirements.txt
+      ansible.builtin.pip:
+        requirements: "{{ app_dir }}/requirements.txt"
+        virtualenv: "{{ venv_dir }}"
+        state: present
+      become_user: "{{ app_user }}"
+      when: requirements_file.stat.exists
+
+    - name: Install core Python dependencies (fallback)
+      ansible.builtin.pip:
+        name:
+          - fastapi
+          - uvicorn[standard]
+          - gunicorn
+          - python-multipart
+          - aiofiles
+        virtualenv: "{{ venv_dir }}"
+        state: present
+      become_user: "{{ app_user }}"
+
+    #  Systemd service 
+    - name: Create systemd service unit for the application
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/python_app.service
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=mytodoapp01 FastAPI Application
+          After=network.target
+          Wants=network.target
+
+          [Service]
+          Type=notify
+          User={{ app_user }}
+          Group={{ app_group }}
+          WorkingDirectory={{ app_dir }}
+          Environment="PATH={{ venv_dir }}/bin:/usr/local/bin:/usr/bin:/bin"
+          Environment="PORT={{ app_port }}"
+          ExecStart={{ venv_dir }}/bin/gunicorn app.main:app \
+            -k uvicorn.workers.UvicornWorker \
+            -w 4 \
+            -b 0.0.0.0:{{ app_port }} \
+            --timeout 120 \
+            --access-logfile - \
+            --error-logfile -
+          Restart=on-failure
+          RestartSec=5
+          KillMode=mixed
+          TimeoutStopSec=30
+
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: Reload systemd daemon
+      ansible.builtin.systemd:
+        daemon_reload: yes
+
+    - name: Enable and start python_app service
+      ansible.builtin.systemd:
+        name: python_app
+        state: restarted
+        enabled: yes
+
+    #  Nginx reverse proxy 
+    - name: Remove default Nginx site
+      ansible.builtin.file:
+        path: /etc/nginx/sites-enabled/default
+        state: absent
+
+    - name: Write Nginx site configuration
+      ansible.builtin.copy:
+        dest: /etc/nginx/sites-available/python_app
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          server {
+              listen 80 default_server;
+              listen [::]:80 default_server;
+
+              server_name _;
+
+              access_log /var/log/nginx/python_app_access.log;
+              error_log  /var/log/nginx/python_app_error.log;
+
+              location / {
+                  proxy_pass         http://127.0.0.1:{{ app_port }};
+                  proxy_http_version 1.1;
+                  proxy_set_header   Upgrade           $http_upgrade;
+                  proxy_set_header   Connection        "upgrade";
+                  proxy_set_header   Host              $host;
+                  proxy_set_header   X-Real-IP         $remote_addr;
+                  proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
+                  proxy_set_header   X-Forwarded-Proto $scheme;
+                  proxy_read_timeout 300s;
+                  proxy_connect_timeout 75s;
+              }
+          }
+
+    - name: Enable Nginx site
+      ansible.builtin.file:
+        src: /etc/nginx/sites-available/python_app
+        dest: /etc/nginx/sites-enabled/python_app
+        state: link
+
+    - name: Test Nginx configuration
+      ansible.builtin.command: nginx -t
+      changed_when: false
+
+    - name: Enable and restart Nginx
+      ansible.builtin.systemd:
+        name: nginx
+        state: restarted
+        enabled: yes
+
+    #  Post-deploy health check (on the instance itself) 
+    - name: Wait for application to be ready
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ app_port }}/health"
+        method: GET
+        status_code: [200, 307]
+        timeout: 10
+      register: health_result
+      retries: 12
+      delay: 10
+      until: health_result.status in [200, 307]
+
+    - name: Verify Nginx proxy is routing correctly
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:80/health"
+        method: GET
+        status_code: [200, 307]
+        timeout: 10
+      register: nginx_health
+      retries: 6
+      delay: 5
+      until: nginx_health.status in [200, 307]
+
+    - name: Report deployment success
+      ansible.builtin.debug:
+        msg: >
+          Application deployed successfully.
+          Health endpoint responded with HTTP {{ health_result.status }}.
+          Nginx proxy verified with HTTP {{ nginx_health.status }}.
