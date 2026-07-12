@@ -34,6 +34,24 @@ variable "instance_type" {
   default     = "t3.micro"
 }
 
+variable "db_name" {
+  description = "PostgreSQL database name"
+  type        = string
+  default     = "tododb"
+}
+
+variable "db_user" {
+  description = "PostgreSQL master username"
+  type        = string
+  default     = "todouser"
+}
+
+variable "db_password" {
+  description = "PostgreSQL master password"
+  type        = string
+  sensitive   = true
+}
+
 #  Provider 
 
 provider "aws" {
@@ -69,19 +87,7 @@ data "aws_ami" "ubuntu" {
   }
 }
 
-#  GitHub Actions IP ranges (for SSH ingress restriction) 
-# GitHub publishes its runner CIDR ranges at https://api.github.com/meta
-# The ranges below cover the "actions" key as of the last known stable set.
-# We allow 0.0.0.0/0 here because GitHub rotates these CIDRs frequently and
-# has hundreds of ranges; locking to a static list would break the CI on
-# the next rotation.  Port 22 is restricted to the CI runner by the fact that
-# the key pair never leaves UDAP's SSM store - an attacker without the private
-# key gets nothing from an open SSH port.  For environments that require a
-# hard network control, replace with the current output of
-#   curl -s https://api.github.com/meta | jq -r '.actions[]'
-# and rebuild on rotation.
 locals {
-  # Keeping this as a named local makes it easy to tighten later.
   ssh_allowed_cidrs = ["0.0.0.0/0"]
 }
 
@@ -90,13 +96,14 @@ locals {
 resource "aws_vpc" "main" {
   cidr_block           = "10.0.0.0/16"
   enable_dns_hostnames = true
+  enable_dns_support   = true
 
   tags = {
     Name = "${var.project_name}-vpc"
   }
 }
 
-#  Public Subnet 
+#  Public Subnet (EC2) 
 
 resource "aws_subnet" "public" {
   vpc_id                  = aws_vpc.main.id
@@ -106,6 +113,28 @@ resource "aws_subnet" "public" {
 
   tags = {
     Name = "${var.project_name}-public-subnet"
+  }
+}
+
+#  Private Subnets (RDS — two AZs required for subnet group) 
+
+resource "aws_subnet" "private_a" {
+  vpc_id            = aws_vpc.main.id
+  cidr_block        = "10.0.10.0/24"
+  availability_zone = "${var.aws_region}a"
+
+  tags = {
+    Name = "${var.project_name}-private-subnet-a"
+  }
+}
+
+resource "aws_subnet" "private_b" {
+  vpc_id            = aws_vpc.main.id
+  cidr_block        = "10.0.11.0/24"
+  availability_zone = "${var.aws_region}b"
+
+  tags = {
+    Name = "${var.project_name}-private-subnet-b"
   }
 }
 
@@ -141,7 +170,7 @@ resource "aws_route_table_association" "public" {
   route_table_id = aws_route_table.public.id
 }
 
-#  Security Group 
+#  Security Groups 
 
 resource "aws_security_group" "app" {
   name        = "${var.project_name}-sg"
@@ -166,7 +195,7 @@ resource "aws_security_group" "app" {
     cidr_blocks = ["0.0.0.0/0"]
   }
 
-  # SSH - restricted to known CI/operator ranges (see locals.ssh_allowed_cidrs)
+  # SSH
   ingress {
     description = "SSH for CI/Ansible provisioning"
     from_port   = 22
@@ -186,6 +215,32 @@ resource "aws_security_group" "app" {
 
   tags = {
     Name = "${var.project_name}-sg"
+  }
+}
+
+resource "aws_security_group" "rds" {
+  name        = "${var.project_name}-rds-sg"
+  description = "Allow PostgreSQL access from the app EC2 instance only"
+  vpc_id      = aws_vpc.main.id
+
+  ingress {
+    description     = "PostgreSQL from app SG"
+    from_port       = 5432
+    to_port         = 5432
+    protocol        = "tcp"
+    security_groups = [aws_security_group.app.id]
+  }
+
+  egress {
+    description = "All outbound"
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = {
+    Name = "${var.project_name}-rds-sg"
   }
 }
 
@@ -221,7 +276,7 @@ resource "aws_instance" "app" {
   }
 }
 
-#  Elastic IP (stable public address) 
+#  Elastic IP 
 
 resource "aws_eip" "app" {
   instance = aws_instance.app.id
@@ -234,6 +289,46 @@ resource "aws_eip" "app" {
   depends_on = [aws_internet_gateway.main]
 }
 
+#  RDS Subnet Group 
+
+resource "aws_db_subnet_group" "main" {
+  name       = "${var.project_name}-db-subnet-group"
+  subnet_ids = [aws_subnet.private_a.id, aws_subnet.private_b.id]
+
+  tags = {
+    Name = "${var.project_name}-db-subnet-group"
+  }
+}
+
+#  RDS PostgreSQL Instance 
+
+resource "aws_db_instance" "postgres" {
+  identifier              = "${var.project_name}-db"
+  engine                  = "postgres"
+  engine_version          = "15.7"
+  instance_class          = "db.t3.micro"
+  allocated_storage       = 20
+  storage_type            = "gp2"
+  storage_encrypted       = true
+
+  db_name                 = var.db_name
+  username                = var.db_user
+  password                = var.db_password
+
+  db_subnet_group_name    = aws_db_subnet_group.main.name
+  vpc_security_group_ids  = [aws_security_group.rds.id]
+
+  publicly_accessible     = false
+  multi_az                = false
+  deletion_protection     = false
+  skip_final_snapshot     = true
+  backup_retention_period = 7
+
+  tags = {
+    Name = "${var.project_name}-db"
+  }
+}
+
 #  Outputs 
 
 output "instance_public_ip" {
@@ -244,4 +339,14 @@ output "instance_public_ip" {
 output "app_url" {
   description = "Public URL of the application"
   value       = "http://${aws_eip.app.public_ip}"
+}
+
+output "rds_endpoint" {
+  description = "RDS PostgreSQL endpoint (host:port)"
+  value       = aws_db_instance.postgres.endpoint
+}
+
+output "rds_host" {
+  description = "RDS PostgreSQL hostname"
+  value       = aws_db_instance.postgres.address
 }

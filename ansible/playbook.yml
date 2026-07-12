@@ -9,6 +9,12 @@
     app_group: appuser
     venv_dir: /opt/app/.venv
     python_bin: /usr/bin/python3.11
+    # DB vars — overridden via -e extra-vars from the CI pipeline
+    db_host: ""
+    db_port: "5432"
+    db_name: "tododb"
+    db_user: "todouser"
+    db_password: ""
 
   tasks:
     #  System packages 
@@ -133,11 +139,14 @@
           - gunicorn
           - python-multipart
           - aiofiles
+          - sqlalchemy
+          - psycopg2-binary
+          - python-dotenv
         virtualenv: "{{ venv_dir }}"
         state: present
       become_user: "{{ app_user }}"
 
-    #  Systemd service 
+    #  Systemd service  (DB credentials injected as Environment= lines)
     - name: Create systemd service unit for the application
       ansible.builtin.copy:
         dest: /etc/systemd/system/python_app.service
@@ -157,6 +166,11 @@
           WorkingDirectory={{ app_dir }}
           Environment="PATH={{ venv_dir }}/bin:/usr/local/bin:/usr/bin:/bin"
           Environment="PORT={{ app_port }}"
+          Environment="DB_HOST={{ db_host }}"
+          Environment="DB_PORT={{ db_port }}"
+          Environment="DB_NAME={{ db_name }}"
+          Environment="DB_USER={{ db_user }}"
+          Environment="DB_PASSWORD={{ db_password }}"
           ExecStart={{ venv_dir }}/bin/gunicorn app.main:app \
             -k uvicorn.workers.UvicornWorker \
             -w 4 \

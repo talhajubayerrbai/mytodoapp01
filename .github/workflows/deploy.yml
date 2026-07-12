@@ -40,6 +40,7 @@ jobs:
     needs: [test]
     outputs:
       instance_public_ip: ${{ steps.tf_output.outputs.instance_public_ip }}
+      rds_host: ${{ steps.tf_output.outputs.rds_host }}
 
     steps:
       - name: Checkout repository
@@ -72,14 +73,17 @@ jobs:
           terraform apply -auto-approve \
             -var="project_name=${{ secrets.PROJECT_NAME }}" \
             -var="aws_region=${{ secrets.AWS_REGION }}" \
-            -var="public_key=${{ secrets.SSH_PUBLIC_KEY }}"
+            -var="public_key=${{ secrets.SSH_PUBLIC_KEY }}" \
+            -var="db_password=${{ secrets.DB_PASSWORD }}"
 
       - name: Capture Terraform outputs
         id: tf_output
         working-directory: terraform
         run: |
           IP=$(terraform output -raw instance_public_ip)
+          RDS=$(terraform output -raw rds_host)
           echo "instance_public_ip=${IP}" >> "$GITHUB_OUTPUT"
+          echo "rds_host=${RDS}"          >> "$GITHUB_OUTPUT"
 
   #  3. CONFIGURE (Ansible) 
   configure:
@@ -136,7 +140,11 @@ jobs:
             -u ubuntu \
             --private-key ~/.ssh/id_rsa \
             ansible/playbook.yml \
-            -e "app_port=8000"
+            -e "app_port=8000" \
+            -e "db_host=${{ needs.provision.outputs.rds_host }}" \
+            -e "db_name=${{ secrets.DB_NAME || 'tododb' }}" \
+            -e "db_user=${{ secrets.DB_USER || 'todouser' }}" \
+            -e "db_password=${{ secrets.DB_PASSWORD }}"
 
   #  4. VERIFY 
   verify:
